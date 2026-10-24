@@ -1,0 +1,444 @@
+//! Relay server: binds public keys of nodes to their UDP addresses
+//! and forwards data packets between them.
+
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Bytes;
+use hyper::header::{AUTHORIZATION, HOST};
+use hyper::{Request, StatusCode, Uri};
+use hyper_util::rt::TokioIo;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc;
+
+use iroh_base::PublicKey;
+
+use crate::proto::{self, Key, Message, Nonce};
+
+/// The same header as an iroh relay sends to its HTTP access check
+const ENDPOINT_ID_HEADER: &str = "X-Iroh-Endpoint-Id";
+const ACCESS_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Access decisions are cached and sessions are rechecked after this time
+const ACCESS_CACHE_TTL: Duration = Duration::from_secs(60);
+const CHALLENGE_TTL: Duration = Duration::from_secs(5);
+/// Limits memory used by spoofed `Hello` messages
+const MAX_PENDING_CHALLENGES: usize = 4096;
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Decides which nodes may use the relay
+pub enum Access {
+    AllowAll,
+    /// The same HTTP access check as for an iroh relay (`access.http` in its config):
+    /// a POST request with the `X-Iroh-Endpoint-Id` header, `200` with `true` allows a node
+    Http { url: Uri, token: Option<String> },
+}
+
+impl Access {
+    async fn check(&self, key: &PublicKey) -> Result<bool, String> {
+        match self {
+            Access::AllowAll => Ok(true),
+            Access::Http { url, token } => {
+                tokio::time::timeout(ACCESS_CHECK_TIMEOUT, check_http(url, token.as_deref(), key)).await
+                    .map_err(|_| "timed out".to_string())?
+            }
+        }
+    }
+}
+
+async fn check_http(url: &Uri, token: Option<&str>, key: &PublicKey) -> Result<bool, String> {
+    let authority = url.authority().ok_or("No host in the access url")?;
+    let host = authority.host().trim_start_matches('[').trim_end_matches(']');
+    let port = authority.port_u16().unwrap_or(80);
+    let stream = TcpStream::connect((host, port)).await
+        .map_err(|e| format!("Cannot connect: {e}"))?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+        .map_err(|e| format!("HTTP handshake failed: {e}"))?;
+    tokio::spawn(conn);
+
+    let mut req = Request::post(url.path_and_query().map(|p| p.as_str()).unwrap_or("/"))
+        .header(HOST, authority.as_str())
+        .header(ENDPOINT_ID_HEADER, key.to_string());
+    if let Some(token) = token {
+        req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let req = req.body(Empty::<Bytes>::new())
+        .map_err(|e| format!("Invalid request: {e}"))?;
+    let resp = sender.send_request(req).await
+        .map_err(|e| format!("Request failed: {e}"))?;
+    if resp.status() != StatusCode::OK {
+        return Err(format!("Unexpected status: {}", resp.status()));
+    }
+    let body = resp.into_body().collect().await
+        .map_err(|e| format!("Cannot read response: {e}"))?
+        .to_bytes();
+    Ok(body.as_ref() == b"true")
+}
+
+struct Session {
+    addr: SocketAddr,
+    last_seen: Instant,
+    checked_at: Instant,
+}
+
+struct Challenge {
+    key: Key,
+    nonce: Nonce,
+    expires: Instant,
+}
+
+/// Result of an access check, `None` if the check failed
+type AccessResult = (Key, Option<bool>);
+
+struct Relay {
+    socket: UdpSocket,
+    is_v6: bool,
+    access: Arc<Access>,
+    access_tx: mpsc::Sender<AccessResult>,
+    sessions: HashMap<Key, Session>,
+    by_addr: HashMap<SocketAddr, Key>,
+    challenges: HashMap<SocketAddr, Challenge>,
+    /// Authenticated nodes waiting for an access check
+    authorizing: HashMap<Key, SocketAddr>,
+    access_cache: HashMap<Key, (bool, Instant)>,
+}
+
+pub async fn run(socket: UdpSocket, access: Access) -> io::Result<()> {
+    let (access_tx, mut access_rx) = mpsc::channel(256);
+    let mut relay = Relay {
+        is_v6: socket.local_addr()?.is_ipv6(),
+        socket,
+        access: Arc::new(access),
+        access_tx,
+        sessions: HashMap::new(),
+        by_addr: HashMap::new(),
+        challenges: HashMap::new(),
+        authorizing: HashMap::new(),
+        access_cache: HashMap::new(),
+    };
+    let mut buf = vec![0; proto::MAX_PACKET_LEN];
+    let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+    loop {
+        tokio::select! {
+            res = relay.recv(&mut buf) => match res {
+                Ok((len, src)) => relay.handle_packet(&mut buf[..len], src).await,
+                // ICMP errors of previous sends are reported on some platforms
+                Err(e) => log::debug!("Receive error: {e}"),
+            },
+            Some((key, allowed)) = access_rx.recv() => relay.handle_access(key, allowed).await,
+            _ = sweep.tick() => relay.sweep(),
+        }
+    }
+}
+
+impl Relay {
+    async fn handle_packet(&mut self, buf: &mut [u8], src: SocketAddr) {
+        match proto::decode(buf) {
+            Some(Message::Data { key, .. }) => {
+                let dst = *key;
+                self.forward(buf, src, &dst).await;
+            }
+            Some(Message::Keepalive) => {
+                if self.touch(&src).is_some() {
+                    self.send(&proto::encode_keepalive_ack(), src).await;
+                } else {
+                    self.send(&proto::encode_not_registered(), src).await;
+                }
+            }
+            Some(Message::Hello { version, key }) => {
+                if version != proto::VERSION {
+                    log::debug!("Unsupported version {version} from {src}");
+                    return;
+                }
+                if self.challenges.len() >= MAX_PENDING_CHALLENGES && !self.challenges.contains_key(&src) {
+                    log::debug!("Too many pending challenges, dropping hello from {src}");
+                    return;
+                }
+                let nonce = proto::random_nonce();
+                self.challenges.insert(src, Challenge { key, nonce, expires: Instant::now() + CHALLENGE_TTL });
+                self.send(&proto::encode_challenge(&nonce, &src), src).await;
+            }
+            Some(Message::Auth { key, nonce, signature }) => {
+                let is_expected = self.challenges.get(&src)
+                    .is_some_and(|c| c.key == key && c.nonce == nonce && c.expires > Instant::now());
+                if !is_expected {
+                    return;
+                }
+                self.challenges.remove(&src);
+                let Some(public_key) = proto::verify_auth(&key, &nonce, &signature, &src) else {
+                    log::info!("Invalid signature from {src}");
+                    return;
+                };
+                match self.access_cache.get(&key) {
+                    Some((true, _)) => self.bind(key, src).await,
+                    Some((false, _)) => log::debug!("Access denied: {} ({src})", public_key.fmt_short()),
+                    None => {
+                        self.authorizing.insert(key, src);
+                        self.spawn_access_check(key, public_key);
+                    }
+                }
+            }
+            Some(Message::Challenge { .. } | Message::Registered | Message::KeepaliveAck | Message::NotRegistered)
+            | None => {}
+        }
+    }
+
+    async fn forward(&mut self, buf: &mut [u8], src: SocketAddr, dst: &Key) {
+        let Some(src_key) = self.touch(&src) else {
+            self.send(&proto::encode_not_registered(), src).await;
+            return;
+        };
+        let Some(dst_addr) = self.sessions.get(dst).map(|s| s.addr) else {
+            return;
+        };
+        proto::encode_data_header(buf, &src_key);
+        self.send(buf, dst_addr).await;
+    }
+
+    /// Refreshes a session of a node and returns its key
+    fn touch(&mut self, addr: &SocketAddr) -> Option<Key> {
+        let key = *self.by_addr.get(addr)?;
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.last_seen = Instant::now();
+        }
+        Some(key)
+    }
+
+    async fn bind(&mut self, key: Key, addr: SocketAddr) {
+        let now = Instant::now();
+        let old_session = self.sessions.insert(key, Session { addr, last_seen: now, checked_at: now });
+        if let Some(old_session) = old_session {
+            if old_session.addr != addr {
+                self.by_addr.remove(&old_session.addr);
+            }
+        }
+        if let Some(old_key) = self.by_addr.insert(addr, key) {
+            if old_key != key {
+                self.sessions.remove(&old_key);
+            }
+        }
+        log::info!("Registered {} from {addr}", fmt_key(&key));
+        self.send(&proto::encode_registered(), addr).await;
+    }
+
+    fn remove_session(&mut self, key: &Key) {
+        if let Some(session) = self.sessions.remove(key) {
+            self.by_addr.remove(&session.addr);
+        }
+    }
+
+    fn spawn_access_check(&self, key: Key, public_key: PublicKey) {
+        let access = self.access.clone();
+        let access_tx = self.access_tx.clone();
+        tokio::spawn(async move {
+            let allowed = match access.check(&public_key).await {
+                Ok(allowed) => Some(allowed),
+                Err(e) => {
+                    log::warn!("Access check of {} failed: {e}", public_key.fmt_short());
+                    None
+                }
+            };
+            let _ = access_tx.send((key, allowed)).await;
+        });
+    }
+
+    async fn handle_access(&mut self, key: Key, allowed: Option<bool>) {
+        if let Some(allowed) = allowed {
+            self.access_cache.insert(key, (allowed, Instant::now()));
+        }
+        match (self.authorizing.remove(&key), allowed) {
+            (Some(addr), Some(true)) => self.bind(key, addr).await,
+            (Some(addr), _) => log::info!("Access denied: {} ({addr})", fmt_key(&key)),
+            // A failed recheck keeps the session, so the relay survives restarts of the check service
+            (None, Some(false)) if self.sessions.contains_key(&key) => {
+                log::info!("Access revoked: {}", fmt_key(&key));
+                self.remove_session(&key);
+            }
+            (None, _) => {}
+        }
+    }
+
+    fn sweep(&mut self) {
+        let now = Instant::now();
+        self.challenges.retain(|_, c| c.expires > now);
+        self.access_cache.retain(|_, (_, checked_at)| now.duration_since(*checked_at) < ACCESS_CACHE_TTL);
+
+        let expired = self.sessions.iter()
+            .filter(|(_, s)| now.duration_since(s.last_seen) > proto::SESSION_TTL)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in expired {
+            log::info!("Session expired: {}", fmt_key(&key));
+            self.remove_session(&key);
+        }
+
+        let mut recheck = Vec::new();
+        for (key, session) in self.sessions.iter_mut() {
+            if now.duration_since(session.checked_at) >= ACCESS_CACHE_TTL {
+                session.checked_at = now;
+                recheck.push(*key);
+            }
+        }
+        for key in recheck {
+            if let Ok(public_key) = PublicKey::from_bytes(&key) {
+                self.spawn_access_check(key, public_key);
+            }
+        }
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (len, src) = self.socket.recv_from(buf).await?;
+        Ok((len, proto::canonical_addr(src)))
+    }
+
+    async fn send(&self, packet: &[u8], addr: SocketAddr) {
+        if let Err(e) = self.socket.send_to(packet, proto::socket_addr(self.is_v6, addr)).await {
+            log::debug!("Cannot send to {addr}: {e}");
+        }
+    }
+}
+
+fn fmt_key(key: &Key) -> String {
+    match PublicKey::from_bytes(key) {
+        Ok(key) => key.fmt_short().to_string(),
+        Err(_) => "<invalid key>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh_base::SecretKey;
+
+    use super::*;
+
+    struct Node {
+        socket: UdpSocket,
+        secret_key: SecretKey,
+    }
+
+    impl Node {
+        async fn new(seed: u8) -> Self {
+            Node {
+                socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                secret_key: SecretKey::from_bytes(&[seed; 32]),
+            }
+        }
+
+        fn key(&self) -> Key {
+            *self.secret_key.public().as_bytes()
+        }
+
+        async fn recv(&self) -> Vec<u8> {
+            let mut buf = vec![0; proto::MAX_PACKET_LEN];
+            let len = tokio::time::timeout(Duration::from_secs(2), self.socket.recv(&mut buf)).await
+                .expect("Receive timed out")
+                .unwrap();
+            buf.truncate(len);
+            buf
+        }
+
+        async fn register(&self, relay: SocketAddr) {
+            self.socket.send_to(&proto::encode_hello(&self.secret_key.public()), relay).await.unwrap();
+            let challenge = self.recv().await;
+            let Some(Message::Challenge { nonce, observed_addr }) = proto::decode(&challenge) else {
+                panic!("Expected a challenge: {challenge:?}");
+            };
+            assert_eq!(observed_addr, self.socket.local_addr().unwrap());
+            self.socket.send_to(&proto::encode_auth(&self.secret_key, &nonce, &observed_addr), relay).await
+                .unwrap();
+            assert_eq!(proto::decode(&self.recv().await), Some(Message::Registered));
+        }
+
+        async fn send_data(&self, relay: SocketAddr, dst: &Key, payload: &[u8]) {
+            let mut packet = vec![0; proto::DATA_HEADER_LEN];
+            proto::encode_data_header(&mut packet, dst);
+            packet.extend_from_slice(payload);
+            self.socket.send_to(&packet, relay).await.unwrap();
+        }
+    }
+
+    async fn start_relay() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(run(socket, Access::AllowAll));
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_forward() {
+        let relay = start_relay().await;
+        let a = Node::new(1).await;
+        let b = Node::new(2).await;
+        a.register(relay).await;
+        b.register(relay).await;
+
+        a.send_data(relay, &b.key(), b"hello").await;
+        let packet = b.recv().await;
+        assert_eq!(proto::decode(&packet), Some(Message::Data { key: &a.key(), payload: b"hello" }));
+
+        b.send_data(relay, &a.key(), b"world").await;
+        let packet = a.recv().await;
+        assert_eq!(proto::decode(&packet), Some(Message::Data { key: &b.key(), payload: b"world" }));
+
+        a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
+        assert_eq!(proto::decode(&a.recv().await), Some(Message::KeepaliveAck));
+    }
+
+    #[tokio::test]
+    async fn test_not_registered() {
+        let relay = start_relay().await;
+        let a = Node::new(1).await;
+        let b = Node::new(2).await;
+        b.register(relay).await;
+
+        a.send_data(relay, &b.key(), b"hello").await;
+        assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
+        a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
+        assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_auth() {
+        let relay = start_relay().await;
+        let a = Node::new(1).await;
+        let b = Node::new(2).await;
+        b.register(relay).await;
+
+        // Claims the key of `b` but signs with its own key
+        a.socket.send_to(&proto::encode_hello(&b.secret_key.public()), relay).await.unwrap();
+        let Some(Message::Challenge { nonce, observed_addr }) = proto::decode(&a.recv().await) else {
+            panic!("Expected a challenge");
+        };
+        let mut auth = proto::encode_auth(&a.secret_key, &nonce, &observed_addr);
+        auth[1..1 + proto::KEY_LEN].copy_from_slice(&b.key());
+        a.socket.send_to(&auth, relay).await.unwrap();
+
+        // `b` is still bound to its own address
+        let c = Node::new(3).await;
+        c.register(relay).await;
+        c.send_data(relay, &b.key(), b"to b").await;
+        assert_eq!(proto::decode(&b.recv().await), Some(Message::Data { key: &c.key(), payload: b"to b" }));
+        a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
+        assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
+    }
+
+    #[tokio::test]
+    async fn test_rebind() {
+        let relay = start_relay().await;
+        let a = Node::new(1).await;
+        let b = Node::new(2).await;
+        b.register(relay).await;
+        a.register(relay).await;
+        // The same key from a new address, e.g. after a NAT rebinding
+        let a2 = Node::new(1).await;
+        a2.register(relay).await;
+
+        b.send_data(relay, &a.key(), b"hello").await;
+        assert_eq!(proto::decode(&a2.recv().await), Some(Message::Data { key: &b.key(), payload: b"hello" }));
+        a.send_data(relay, &b.key(), b"stale").await;
+        assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
+    }
+}
