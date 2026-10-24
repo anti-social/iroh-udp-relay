@@ -21,8 +21,8 @@ use iroh_base::PublicKey;
 
 use crate::proto::{self, Key, Message, Nonce};
 
-pub use self::metrics::{Metrics, NodeLabels};
-use self::metrics::NodeCounters;
+pub use self::metrics::{LinkLabels, Metrics};
+use self::metrics::LinkCounters;
 
 /// The same header as an iroh relay sends to its HTTP access check
 const ENDPOINT_ID_HEADER: &str = "X-Iroh-Endpoint-Id";
@@ -87,13 +87,32 @@ struct Session {
     addr: SocketAddr,
     last_seen: Instant,
     checked_at: Instant,
-    counters: NodeCounters,
+    /// Label of the node in metrics
+    endpoint: String,
+    /// Counters of traffic to other nodes
+    links: HashMap<Key, LinkCounters>,
 }
 
 struct Challenge {
     key: Key,
     nonce: Nonce,
     expires: Instant,
+}
+
+/// Options of the relay server
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct Options {
+    /// Label traffic metrics with endpoint ids. Otherwise registered endpoints are
+    /// labeled [`LinkLabels::REGISTERED`], so a public relay doesn't track who talks to whom
+    pub endpoint_labels: bool,
+}
+
+impl Options {
+    pub fn endpoint_labels(mut self, enabled: bool) -> Self {
+        self.endpoint_labels = enabled;
+        self
+    }
 }
 
 /// Result of an access check, `None` if the check failed
@@ -111,9 +130,10 @@ struct Relay {
     authorizing: HashMap<Key, SocketAddr>,
     access_cache: HashMap<Key, (bool, Instant)>,
     metrics: Arc<Metrics>,
+    options: Options,
 }
 
-pub async fn run(socket: UdpSocket, access: Access, metrics: Arc<Metrics>) -> io::Result<()> {
+pub async fn run(socket: UdpSocket, access: Access, metrics: Arc<Metrics>, options: Options) -> io::Result<()> {
     let (access_tx, mut access_rx) = mpsc::channel(256);
     let mut relay = Relay {
         is_v6: socket.local_addr()?.is_ipv6(),
@@ -126,6 +146,7 @@ pub async fn run(socket: UdpSocket, access: Access, metrics: Arc<Metrics>) -> io
         authorizing: HashMap::new(),
         access_cache: HashMap::new(),
         metrics,
+        options,
     };
     let mut buf = vec![0; proto::MAX_PACKET_LEN];
     let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
@@ -210,25 +231,33 @@ impl Relay {
     }
 
     async fn forward(&mut self, buf: &mut [u8], src: SocketAddr, dst: &Key) {
-        let Some(src_session) = self.touch(&src).and_then(|key| self.sessions.get(&key).map(|s| (key, s))) else {
-            let counters = self.metrics.node(&NodeLabels::unregistered());
-            counters.recv(buf.len());
-            counters.data_packets_dropped.inc();
+        let Some(src_key) = self.touch(&src) else {
+            let dst_endpoint = self.sessions.get(dst).map_or(LinkLabels::UNREGISTERED, |s| &s.endpoint);
+            self.metrics.dropped(LinkLabels::UNREGISTERED, dst_endpoint);
             self.send_not_registered(src).await;
             return;
         };
-        let (src_key, src_counters) = (src_session.0, &src_session.1.counters);
-        src_counters.recv(buf.len());
+        let src_session = &self.sessions[&src_key];
         let Some(dst_session) = self.sessions.get(dst) else {
-            src_counters.data_packets_dropped.inc();
+            self.metrics.dropped(&src_session.endpoint, LinkLabels::UNREGISTERED);
             return;
         };
         proto::encode_data_header(buf, &src_key);
         if self.send(buf, dst_session.addr).await {
-            dst_session.counters.sent(buf.len());
+            self.link(&src_key, dst).relayed(buf.len());
         } else {
-            src_counters.data_packets_dropped.inc();
+            self.metrics.dropped(&src_session.endpoint, &dst_session.endpoint);
         }
+    }
+
+    /// Returns counters of traffic between two registered nodes
+    fn link(&mut self, src: &Key, dst: &Key) -> &LinkCounters {
+        if !self.sessions[src].links.contains_key(dst) {
+            let labels = LinkLabels::new(&self.sessions[src].endpoint, &self.sessions[dst].endpoint);
+            let counters = self.metrics.link(&labels);
+            self.sessions.get_mut(src).unwrap().links.insert(*dst, counters);
+        }
+        &self.sessions[src].links[dst]
     }
 
     /// Refreshes a session of a node and returns its key
@@ -242,16 +271,29 @@ impl Relay {
 
     async fn bind(&mut self, key: Key, addr: SocketAddr) {
         let now = Instant::now();
-        let counters = self.metrics.node(&node_labels(&key));
-        let old_session = self.sessions.insert(key, Session { addr, last_seen: now, checked_at: now, counters });
-        if let Some(old_session) = old_session {
-            if old_session.addr != addr {
-                self.by_addr.remove(&old_session.addr);
+        let session = match self.sessions.remove(&key) {
+            // The same node from a new address keeps its counters
+            Some(old_session) => {
+                if old_session.addr != addr {
+                    self.by_addr.remove(&old_session.addr);
+                }
+                Session { addr, last_seen: now, checked_at: now, ..old_session }
             }
-        }
+            None => {
+                let endpoint = if self.options.endpoint_labels {
+                    fmt_key(&key)
+                } else {
+                    LinkLabels::REGISTERED.to_string()
+                };
+                Session { addr, last_seen: now, checked_at: now, endpoint, links: HashMap::new() }
+            }
+        };
+        self.sessions.insert(key, session);
         if let Some(old_key) = self.by_addr.insert(addr, key) {
-            if old_key != key && self.sessions.remove(&old_key).is_some() {
-                self.metrics.remove_node(&node_labels(&old_key));
+            if old_key != key {
+                if let Some(old_session) = self.sessions.remove(&old_key) {
+                    self.remove_links(&old_key, &old_session);
+                }
             }
         }
         self.metrics.registrations.inc();
@@ -263,9 +305,20 @@ impl Relay {
     fn remove_session(&mut self, key: &Key) {
         if let Some(session) = self.sessions.remove(key) {
             self.by_addr.remove(&session.addr);
-            self.metrics.remove_node(&node_labels(key));
+            self.remove_links(key, &session);
         }
         self.metrics.sessions.set(self.sessions.len() as i64);
+    }
+
+    /// Removes counters of traffic from and to a removed node
+    fn remove_links(&mut self, key: &Key, session: &Session) {
+        for peer in self.sessions.values_mut() {
+            peer.links.remove(key);
+        }
+        // Without endpoint labels the series are shared by all endpoints, and there are only a few of them
+        if self.options.endpoint_labels {
+            self.metrics.remove_endpoint(&session.endpoint, self.sessions.values().map(|s| s.endpoint.as_str()));
+        }
     }
 
     fn spawn_access_check(&self, key: Key, public_key: PublicKey) {
@@ -375,11 +428,6 @@ fn fmt_key(key: &Key) -> String {
     }
 }
 
-/// Only keys of registered nodes are passed, they are verified
-fn node_labels(key: &Key) -> NodeLabels {
-    NodeLabels { endpoint: fmt_key(key) }
-}
-
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
@@ -387,9 +435,11 @@ mod tests {
 
     use super::*;
 
-    fn count(family: &Family<NodeLabels, Counter>, labels: &NodeLabels) -> u64 {
-        family.get(labels).map_or(0, |counter| counter.get())
+    fn count(family: &Family<LinkLabels, Counter>, src: &str, dst: &str) -> u64 {
+        family.get(&LinkLabels::new(src, dst)).map_or(0, |counter| counter.get())
     }
+
+    const UNREGISTERED: &str = LinkLabels::UNREGISTERED;
 
     struct Node {
         socket: UdpSocket,
@@ -408,8 +458,8 @@ mod tests {
             *self.secret_key.public().as_bytes()
         }
 
-        fn labels(&self) -> NodeLabels {
-            node_labels(&self.key())
+        fn endpoint(&self) -> String {
+            fmt_key(&self.key())
         }
 
         async fn recv(&self) -> Vec<u8> {
@@ -442,10 +492,14 @@ mod tests {
     }
 
     async fn start_relay() -> (SocketAddr, Arc<Metrics>) {
+        start_relay_with(Options::default().endpoint_labels(true)).await
+    }
+
+    async fn start_relay_with(options: Options) -> (SocketAddr, Arc<Metrics>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let metrics = Arc::new(Metrics::default());
-        tokio::spawn(run(socket, Access::AllowAll, metrics.clone()));
+        tokio::spawn(run(socket, Access::AllowAll, metrics.clone(), options));
         (addr, metrics)
     }
 
@@ -473,17 +527,16 @@ mod tests {
         assert_eq!(metrics.registrations.get(), 2);
         assert_eq!(metrics.got_keepalive.get(), 1);
         let packet_len = proto::DATA_HEADER_LEN as u64 + 5;
-        for node in [&a, &b] {
-            assert_eq!(count(&metrics.data_packets_recv, &node.labels()), 1);
-            assert_eq!(count(&metrics.bytes_recv, &node.labels()), packet_len);
-            assert_eq!(count(&metrics.data_packets_sent, &node.labels()), 1);
-            assert_eq!(count(&metrics.bytes_sent, &node.labels()), packet_len);
-            assert_eq!(count(&metrics.data_packets_dropped, &node.labels()), 0);
+        for (src, dst) in [(&a, &b), (&b, &a)] {
+            assert_eq!(count(&metrics.data_packets_relayed, &src.endpoint(), &dst.endpoint()), 1);
+            assert_eq!(count(&metrics.bytes_relayed, &src.endpoint(), &dst.endpoint()), packet_len);
         }
+        assert_eq!(metrics.bytes_relayed.len(), 2);
+        assert!(metrics.data_packets_dropped.is_empty());
     }
 
     #[tokio::test]
-    async fn test_node_metrics() {
+    async fn test_link_metrics() {
         let (relay, metrics) = start_relay().await;
         let a = Node::new(1).await;
         let b = Node::new(2).await;
@@ -494,35 +547,70 @@ mod tests {
         a.send_data(relay, &b.key(), b"two").await;
         b.recv().await;
         b.recv().await;
+        b.send_data(relay, &a.key(), b"back").await;
+        a.recv().await;
         // Nobody is registered with this key
         a.send_data(relay, &[0; proto::KEY_LEN], b"lost").await;
         a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
         assert_eq!(proto::decode(&a.recv().await), Some(Message::KeepaliveAck));
 
-        // The sender sends, the recipient receives
-        assert_eq!(count(&metrics.data_packets_recv, &a.labels()), 3);
-        assert_eq!(count(&metrics.data_packets_dropped, &a.labels()), 1);
-        assert_eq!(count(&metrics.data_packets_sent, &a.labels()), 0);
-        assert_eq!(count(&metrics.data_packets_recv, &b.labels()), 0);
-        assert_eq!(count(&metrics.data_packets_sent, &b.labels()), 2);
-        assert_eq!(count(&metrics.bytes_sent, &b.labels()), 2 * (proto::DATA_HEADER_LEN as u64 + 3));
+        assert_eq!(count(&metrics.data_packets_relayed, &a.endpoint(), &b.endpoint()), 2);
+        assert_eq!(count(&metrics.bytes_relayed, &a.endpoint(), &b.endpoint()), 2 * (proto::DATA_HEADER_LEN as u64 + 3));
+        assert_eq!(count(&metrics.data_packets_relayed, &b.endpoint(), &a.endpoint()), 1);
         // The destination key of the lost packet is not a label
-        assert_eq!(metrics.data_packets_recv.len(), 2);
-
-        // Another key from the same address replaces the session of `a` with its labels
-        let a_labels = a.labels();
-        let c = Node { socket: a.socket, secret_key: SecretKey::from_bytes(&[3; 32]) };
-        c.register(relay).await;
-        assert!(metrics.data_packets_recv.get(&a_labels).is_none());
-        assert!(metrics.bytes_sent.get(&a_labels).is_none());
-        assert!(metrics.data_packets_recv.get(&c.labels()).is_some());
-        assert_eq!(metrics.sessions.get(), 2);
+        assert_eq!(count(&metrics.data_packets_dropped, &a.endpoint(), UNREGISTERED), 1);
+        assert_eq!(metrics.data_packets_dropped.len(), 1);
 
         let mut registry = iroh_metrics::Registry::default();
         registry.register(metrics.clone());
         let output = registry.encode_openmetrics_to_string().unwrap();
-        let b_bytes = format!("udprelay_bytes_sent_total{{endpoint=\"{}\"}} 72", b.labels().endpoint);
-        assert!(output.contains(&b_bytes), "{output}");
+        let a_to_b = format!(
+            "udprelay_bytes_relayed_total{{src_endpoint=\"{}\",dst_endpoint=\"{}\"}} 72",
+            a.endpoint(),
+            b.endpoint(),
+        );
+        assert!(output.contains(&a_to_b), "{output}");
+
+        // Another key from the same address replaces the session of `a`
+        // with the labels of traffic from and to it
+        let a_endpoint = a.endpoint();
+        let c = Node { socket: a.socket, secret_key: SecretKey::from_bytes(&[3; 32]) };
+        c.register(relay).await;
+        b.send_data(relay, &c.key(), b"to c").await;
+        c.recv().await;
+        assert_eq!(count(&metrics.data_packets_relayed, &b.endpoint(), &c.endpoint()), 1);
+        assert!(metrics.data_packets_relayed.get(&LinkLabels::new(&a_endpoint, &b.endpoint())).is_none());
+        assert!(metrics.data_packets_relayed.get(&LinkLabels::new(&b.endpoint(), &a_endpoint)).is_none());
+        assert!(metrics.data_packets_dropped.is_empty());
+        assert_eq!(metrics.bytes_relayed.len(), 1);
+        assert_eq!(metrics.sessions.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_without_endpoint_labels() {
+        const REGISTERED: &str = LinkLabels::REGISTERED;
+        let (relay, metrics) = start_relay_with(Options::default()).await;
+        let a = Node::new(1).await;
+        let b = Node::new(2).await;
+        a.register(relay).await;
+        b.register(relay).await;
+
+        a.send_data(relay, &b.key(), b"to b").await;
+        b.recv().await;
+        b.send_data(relay, &a.key(), b"to a").await;
+        a.recv().await;
+        a.send_data(relay, &[0; proto::KEY_LEN], b"lost").await;
+
+        // Replacing a session keeps the series, they are shared with other endpoints
+        let c = Node { socket: a.socket, secret_key: SecretKey::from_bytes(&[3; 32]) };
+        c.register(relay).await;
+        b.send_data(relay, &c.key(), b"to c").await;
+        c.recv().await;
+
+        assert_eq!(count(&metrics.data_packets_relayed, REGISTERED, REGISTERED), 3);
+        assert_eq!(count(&metrics.data_packets_dropped, REGISTERED, UNREGISTERED), 1);
+        assert_eq!(metrics.data_packets_relayed.len(), 1);
+        assert_eq!(metrics.data_packets_dropped.len(), 1);
     }
 
     #[tokio::test]
@@ -537,10 +625,8 @@ mod tests {
         a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
         assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
 
-        let unregistered = NodeLabels::unregistered();
-        assert_eq!(count(&metrics.data_packets_recv, &unregistered), 1);
-        assert_eq!(count(&metrics.data_packets_dropped, &unregistered), 1);
-        assert_eq!(count(&metrics.data_packets_sent, &b.labels()), 0);
+        assert_eq!(count(&metrics.data_packets_dropped, UNREGISTERED, &b.endpoint()), 1);
+        assert!(metrics.data_packets_relayed.is_empty());
         assert_eq!(metrics.sent_not_registered.get(), 2);
     }
 
@@ -591,7 +677,7 @@ mod tests {
         // The new address replaces the old one, the node keeps its counters
         assert_eq!(metrics.sessions.get(), 2);
         assert_eq!(metrics.registrations.get(), 3);
-        assert_eq!(count(&metrics.data_packets_sent, &a.labels()), 1);
-        assert_eq!(count(&metrics.data_packets_dropped, &NodeLabels::unregistered()), 1);
+        assert_eq!(count(&metrics.data_packets_relayed, &b.endpoint(), &a.endpoint()), 1);
+        assert_eq!(count(&metrics.data_packets_dropped, UNREGISTERED, &b.endpoint()), 1);
     }
 }

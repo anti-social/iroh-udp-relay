@@ -1,6 +1,6 @@
 [package]
 name = "iroh-udp-relay"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "UDP relay for iroh endpoints that cannot connect directly"
 

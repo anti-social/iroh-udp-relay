@@ -38,6 +38,7 @@ cargo build --release --features server
 | `--access-url` | HTTP access check, see below. Without it any endpoint may use the relay |
 | `--access-token-file` | File with a bearer token for the access check |
 | `--metrics-addr` | TCP address to serve Prometheus metrics on (`/metrics`). Disabled if not set |
+| `--endpoint-labels` | Label traffic metrics with endpoint ids, see [Metrics](#metrics). Disabled by default |
 
 Set the log level with `RUST_LOG` (`info` by default).
 
@@ -57,8 +58,8 @@ The metrics follow iroh-relay's `relayserver` group, with the prefix `udprelay_`
 
 | Metric | Description |
 |---|---|
-| `bytes_recv_total`, `bytes_sent_total` | Relayed traffic, including the data header. Per endpoint: received from it, sent to it |
-| `data_packets_recv_total`, `data_packets_sent_total`, `data_packets_dropped_total` | Data packets, per endpoint the same way. Dropped means the sender or the recipient is not registered, or sending failed; it is counted for the sender |
+| `bytes_relayed_total` | Relayed traffic, including the data header |
+| `data_packets_relayed_total`, `data_packets_dropped_total` | Relayed and dropped data packets |
 | `other_packets_recv_total`, `other_packets_sent_total` | Control packets |
 | `unknown_packets_total`, `send_errors_total` | Unknown packets and failed sends |
 | `got_keepalive_total`, `sent_keepalive_ack_total` | Keepalives |
@@ -68,15 +69,21 @@ The metrics follow iroh-relay's `relayserver` group, with the prefix `udprelay_`
 | `auth_failures_total`, `challenges_dropped_total` | Failed signatures, and `Hello`s dropped when too many challenges are pending |
 | `access_denied_total`, `access_revoked_total`, `access_check_errors_total` | Access check results |
 
-The traffic and data packet metrics have an `endpoint` label: the short endpoint id that iroh prints in logs, for example `udprelay_bytes_recv_total{endpoint="b2f36aadd4"}`.
+The traffic and data packet metrics have `src_endpoint` and `dst_endpoint` labels for the sender and the recipient.
 
-- **Unregistered senders:** packets from addresses without a registration are counted under `endpoint="unregistered"`.
-- **Bounded:** only registered endpoints get their own label. The destination key of a packet is never a label, because a sender can put anything there.
-- **Cleanup:** an endpoint's series are removed when its session expires, is revoked or is replaced. After that, its counters start from zero, which `rate()` and `increase()` handle as a reset.
+- **Endpoint ids:** with `--endpoint-labels`, a registered endpoint is labeled with its short endpoint id, as iroh prints it in logs. For example `udprelay_bytes_relayed_total{src_endpoint="b2f36aadd4",dst_endpoint="5e0c1a9f3b"}`. This shows which endpoints talk to each other and how much, so it's better kept disabled on a public relay.
+- **Without endpoint ids** (the default), every registered endpoint is labeled `registered`. The totals and drop reasons still work.
+- **Unregistered endpoints:** a sender address or a recipient key without a registration is labeled `unregistered`.
+- **Drop reasons:** the labels of a dropped packet tell why it was dropped. Either the sender or the recipient is `unregistered`, or both are registered and sending failed.
+- **Bounded:** only registered endpoints get their own label, so there are at most as many series as pairs of endpoints that exchange traffic. The recipient key of a packet only becomes a label when that endpoint is registered, because a sender can put anything there.
+- **Cleanup:** with endpoint ids, the series of an endpoint, as a sender or a recipient, are removed when its session expires, is revoked or is replaced. After that, its counters start from zero, which `rate()` and `increase()` handle as a reset.
 
-For totals, sum over the label: `sum(rate(udprelay_bytes_sent_total[5m]))`.
+Useful queries:
+- traffic between endpoints: `sum by (src_endpoint, dst_endpoint) (rate(udprelay_bytes_relayed_total[5m]))`;
+- sent or received by each endpoint: `sum by (src_endpoint)` or `sum by (dst_endpoint)`;
+- total: `sum(rate(udprelay_bytes_relayed_total[5m]))`.
 
-To use the server from your own code, call `server::run(socket, access, metrics)` with the `server` feature enabled.
+To use the server from your own code, call `server::run(socket, access, metrics, options)` with the `server` feature enabled.
 
 ## Client
 

@@ -8,7 +8,7 @@ use snafu::{ResultExt, Whatever};
 use tokio::net::UdpSocket;
 
 use iroh_udp_relay::proto;
-use iroh_udp_relay::server::{self, Access, Metrics};
+use iroh_udp_relay::server::{self, Access, Metrics, Options};
 
 const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::V4(
     SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, proto::DEFAULT_PORT)
@@ -30,6 +30,10 @@ struct Args {
     /// tcp address to serve prometheus metrics on (`/metrics`), disabled if not set
     #[argh(option)]
     metrics_addr: Option<SocketAddr>,
+    /// label traffic metrics with endpoint ids, it shows which endpoints talk
+    /// to each other, so it is better kept disabled on a public relay
+    #[argh(switch)]
+    endpoint_labels: bool,
 }
 
 #[tokio::main]
@@ -76,8 +80,9 @@ async fn main() -> Result<(), Whatever> {
     let socket = UdpSocket::bind(args.bind_addr).await
         .with_whatever_context(|_| format!("Cannot bind: {}", args.bind_addr))?;
     log::info!("Listening on {}", args.bind_addr);
+    let options = Options::default().endpoint_labels(args.endpoint_labels);
     tokio::select! {
-        res = server::run(socket, access, metrics) => res.whatever_context("Relay failed"),
+        res = server::run(socket, access, metrics, options) => res.whatever_context("Relay failed"),
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }

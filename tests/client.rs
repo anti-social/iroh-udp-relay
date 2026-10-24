@@ -27,7 +27,7 @@ impl ProtocolHandler for Echo {
 async fn start_relay() -> String {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
-    tokio::spawn(server::run(socket, Access::AllowAll, Default::default()));
+    tokio::spawn(server::run(socket, Access::AllowAll, Default::default(), Default::default()));
     addr.to_string()
 }
 

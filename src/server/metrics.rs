@@ -2,52 +2,49 @@ use std::sync::Arc;
 
 use iroh_metrics::{Counter, EncodeLabelSet, Family, Gauge, MetricsGroup};
 
-/// Labels of per node metrics
+/// Labels of metrics about traffic between two nodes
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelSet)]
-pub struct NodeLabels {
-    /// Short endpoint id of a registered node, as iroh prints it in logs,
-    /// or [`NodeLabels::UNREGISTERED`]
-    pub endpoint: String,
+pub struct LinkLabels {
+    /// Short endpoint id of the sender as iroh prints it in logs,
+    /// [`LinkLabels::REGISTERED`] or [`LinkLabels::UNREGISTERED`]
+    pub src_endpoint: String,
+    /// The same for the recipient
+    pub dst_endpoint: String,
 }
 
-impl NodeLabels {
-    /// Packets from addresses without a registration
+impl LinkLabels {
+    /// A sender address without a registration, or a recipient key without one.
+    /// Such keys are not labels because a packet can contain anything
     pub const UNREGISTERED: &str = "unregistered";
+    /// Any registered endpoint, when endpoint labels are disabled
+    pub const REGISTERED: &str = "registered";
 
-    pub fn unregistered() -> Self {
-        Self { endpoint: Self::UNREGISTERED.to_string() }
+    pub fn new(src_endpoint: &str, dst_endpoint: &str) -> Self {
+        Self { src_endpoint: src_endpoint.to_string(), dst_endpoint: dst_endpoint.to_string() }
     }
 }
 
 /// Metrics tracked by the relay server
 ///
-/// Per node metrics are labeled only with keys of registered nodes, so their
-/// number is bounded by the sessions. Labels of a node are removed with its session.
+/// Traffic metrics are labeled only with keys of registered nodes, so their
+/// number is bounded by pairs of sessions. Labels of a node are removed with its session.
+/// Endpoint ids are labels only if [`Options::endpoint_labels`](super::Options) is enabled.
 #[derive(Debug, Default, MetricsGroup)]
 #[metrics(name = "udprelay")]
 #[non_exhaustive]
 pub struct Metrics {
     /*
-     * Metrics about packets, by node
+     * Metrics about packets, by sender and recipient
      */
-    /// Bytes of `Data` packets received from a node, including the data header
-    #[metrics(help = "Number of bytes received.")]
-    pub bytes_recv: Family<NodeLabels, Counter>,
-    /// Bytes of `Data` packets forwarded to a node, including the data header
-    #[metrics(help = "Number of bytes sent.")]
-    pub bytes_sent: Family<NodeLabels, Counter>,
-
-    /// `Data` packets received from a node
-    #[metrics(help = "Number of 'data' packets received.")]
-    pub data_packets_recv: Family<NodeLabels, Counter>,
-    /// `Data` packets forwarded to a node
+    /// Bytes of forwarded `Data` packets, including the data header
+    #[metrics(help = "Number of bytes relayed.")]
+    pub bytes_relayed: Family<LinkLabels, Counter>,
     #[metrics(help = "Number of 'data' packets relayed.")]
-    pub data_packets_sent: Family<NodeLabels, Counter>,
-    /// `Data` packets of a node that were not forwarded: the sender or the recipient
-    /// is not registered or sending failed. Labeled with the sender because a recipient
-    /// key comes from a packet and can be anything
+    pub data_packets_relayed: Family<LinkLabels, Counter>,
+    /// `Data` packets that were not forwarded. The labels tell why: the sender
+    /// or the recipient is unregistered, otherwise sending failed
     #[metrics(help = "Number of 'data' packets dropped.")]
-    pub data_packets_dropped: Family<NodeLabels, Counter>,
+    pub data_packets_dropped: Family<LinkLabels, Counter>,
 
     /*
      * Metrics about other packets
@@ -98,44 +95,41 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Returns counters of a node, they are cached to avoid a label lookup per packet
-    pub(crate) fn node(&self, labels: &NodeLabels) -> NodeCounters {
-        NodeCounters {
-            bytes_recv: self.bytes_recv.get_or_create(labels),
-            bytes_sent: self.bytes_sent.get_or_create(labels),
-            data_packets_recv: self.data_packets_recv.get_or_create(labels),
-            data_packets_sent: self.data_packets_sent.get_or_create(labels),
-            data_packets_dropped: self.data_packets_dropped.get_or_create(labels),
+    /// Returns counters of a link, they are cached to avoid a label lookup per packet
+    pub(crate) fn link(&self, labels: &LinkLabels) -> LinkCounters {
+        LinkCounters {
+            bytes: self.bytes_relayed.get_or_create(labels),
+            packets: self.data_packets_relayed.get_or_create(labels),
         }
     }
 
-    pub(crate) fn remove_node(&self, labels: &NodeLabels) {
-        self.bytes_recv.remove(labels);
-        self.bytes_sent.remove(labels);
-        self.data_packets_recv.remove(labels);
-        self.data_packets_sent.remove(labels);
-        self.data_packets_dropped.remove(labels);
+    /// Drops are rare, so their counters are not cached
+    pub(crate) fn dropped(&self, src_endpoint: &str, dst_endpoint: &str) {
+        self.data_packets_dropped.get_or_create(&LinkLabels::new(src_endpoint, dst_endpoint)).inc();
+    }
+
+    /// Removes metrics of links between a node and its `peers`, itself and unregistered nodes
+    pub(crate) fn remove_endpoint<'a>(&self, endpoint: &'a str, peers: impl IntoIterator<Item = &'a str>) {
+        for peer in peers.into_iter().chain([endpoint, LinkLabels::UNREGISTERED]) {
+            for labels in [LinkLabels::new(endpoint, peer), LinkLabels::new(peer, endpoint)] {
+                self.bytes_relayed.remove(&labels);
+                self.data_packets_relayed.remove(&labels);
+                self.data_packets_dropped.remove(&labels);
+            }
+        }
     }
 }
 
-/// Per node counters of [`Metrics`]
+/// Counters of [`Metrics`] for traffic from one node to another
 #[derive(Debug)]
-pub(crate) struct NodeCounters {
-    pub bytes_recv: Arc<Counter>,
-    pub bytes_sent: Arc<Counter>,
-    pub data_packets_recv: Arc<Counter>,
-    pub data_packets_sent: Arc<Counter>,
-    pub data_packets_dropped: Arc<Counter>,
+pub(crate) struct LinkCounters {
+    bytes: Arc<Counter>,
+    packets: Arc<Counter>,
 }
 
-impl NodeCounters {
-    pub fn recv(&self, len: usize) {
-        self.data_packets_recv.inc();
-        self.bytes_recv.inc_by(len as u64);
-    }
-
-    pub fn sent(&self, len: usize) {
-        self.data_packets_sent.inc();
-        self.bytes_sent.inc_by(len as u64);
+impl LinkCounters {
+    pub fn relayed(&self, len: usize) {
+        self.packets.inc();
+        self.bytes.inc_by(len as u64);
     }
 }
