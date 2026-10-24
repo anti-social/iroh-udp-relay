@@ -21,7 +21,8 @@ use iroh_base::PublicKey;
 
 use crate::proto::{self, Key, Message, Nonce};
 
-pub use self::metrics::Metrics;
+pub use self::metrics::{Metrics, NodeLabels};
+use self::metrics::NodeCounters;
 
 /// The same header as an iroh relay sends to its HTTP access check
 const ENDPOINT_ID_HEADER: &str = "X-Iroh-Endpoint-Id";
@@ -86,6 +87,7 @@ struct Session {
     addr: SocketAddr,
     last_seen: Instant,
     checked_at: Instant,
+    counters: NodeCounters,
 }
 
 struct Challenge {
@@ -144,8 +146,6 @@ impl Relay {
     async fn handle_packet(&mut self, buf: &mut [u8], src: SocketAddr) {
         match proto::decode(buf) {
             Some(Message::Data { key, .. }) => {
-                self.metrics.data_packets_recv.inc();
-                self.metrics.bytes_recv.inc_by(buf.len() as u64);
                 let dst = *key;
                 self.forward(buf, src, &dst).await;
             }
@@ -210,21 +210,24 @@ impl Relay {
     }
 
     async fn forward(&mut self, buf: &mut [u8], src: SocketAddr, dst: &Key) {
-        let Some(src_key) = self.touch(&src) else {
-            self.metrics.data_packets_dropped.inc();
+        let Some(src_session) = self.touch(&src).and_then(|key| self.sessions.get(&key).map(|s| (key, s))) else {
+            let counters = self.metrics.node(&NodeLabels::unregistered());
+            counters.recv(buf.len());
+            counters.data_packets_dropped.inc();
             self.send_not_registered(src).await;
             return;
         };
-        let Some(dst_addr) = self.sessions.get(dst).map(|s| s.addr) else {
-            self.metrics.data_packets_dropped.inc();
+        let (src_key, src_counters) = (src_session.0, &src_session.1.counters);
+        src_counters.recv(buf.len());
+        let Some(dst_session) = self.sessions.get(dst) else {
+            src_counters.data_packets_dropped.inc();
             return;
         };
         proto::encode_data_header(buf, &src_key);
-        if self.send(buf, dst_addr).await {
-            self.metrics.data_packets_sent.inc();
-            self.metrics.bytes_sent.inc_by(buf.len() as u64);
+        if self.send(buf, dst_session.addr).await {
+            dst_session.counters.sent(buf.len());
         } else {
-            self.metrics.data_packets_dropped.inc();
+            src_counters.data_packets_dropped.inc();
         }
     }
 
@@ -239,15 +242,16 @@ impl Relay {
 
     async fn bind(&mut self, key: Key, addr: SocketAddr) {
         let now = Instant::now();
-        let old_session = self.sessions.insert(key, Session { addr, last_seen: now, checked_at: now });
+        let counters = self.metrics.node(&node_labels(&key));
+        let old_session = self.sessions.insert(key, Session { addr, last_seen: now, checked_at: now, counters });
         if let Some(old_session) = old_session {
             if old_session.addr != addr {
                 self.by_addr.remove(&old_session.addr);
             }
         }
         if let Some(old_key) = self.by_addr.insert(addr, key) {
-            if old_key != key {
-                self.sessions.remove(&old_key);
+            if old_key != key && self.sessions.remove(&old_key).is_some() {
+                self.metrics.remove_node(&node_labels(&old_key));
             }
         }
         self.metrics.registrations.inc();
@@ -259,6 +263,7 @@ impl Relay {
     fn remove_session(&mut self, key: &Key) {
         if let Some(session) = self.sessions.remove(key) {
             self.by_addr.remove(&session.addr);
+            self.metrics.remove_node(&node_labels(key));
         }
         self.metrics.sessions.set(self.sessions.len() as i64);
     }
@@ -370,11 +375,21 @@ fn fmt_key(key: &Key) -> String {
     }
 }
 
+/// Only keys of registered nodes are passed, they are verified
+fn node_labels(key: &Key) -> NodeLabels {
+    NodeLabels { endpoint: fmt_key(key) }
+}
+
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
+    use iroh_metrics::{Counter, Family, MetricsSource};
 
     use super::*;
+
+    fn count(family: &Family<NodeLabels, Counter>, labels: &NodeLabels) -> u64 {
+        family.get(labels).map_or(0, |counter| counter.get())
+    }
 
     struct Node {
         socket: UdpSocket,
@@ -391,6 +406,10 @@ mod tests {
 
         fn key(&self) -> Key {
             *self.secret_key.public().as_bytes()
+        }
+
+        fn labels(&self) -> NodeLabels {
+            node_labels(&self.key())
         }
 
         async fn recv(&self) -> Vec<u8> {
@@ -452,12 +471,58 @@ mod tests {
         // Packets are processed in order, so the ack means the forwarded packets are counted
         assert_eq!(metrics.sessions.get(), 2);
         assert_eq!(metrics.registrations.get(), 2);
-        assert_eq!(metrics.data_packets_recv.get(), 2);
-        assert_eq!(metrics.data_packets_sent.get(), 2);
-        assert_eq!(metrics.data_packets_dropped.get(), 0);
-        assert_eq!(metrics.bytes_recv.get(), 2 * (proto::DATA_HEADER_LEN as u64 + 5));
-        assert_eq!(metrics.bytes_sent.get(), metrics.bytes_recv.get());
         assert_eq!(metrics.got_keepalive.get(), 1);
+        let packet_len = proto::DATA_HEADER_LEN as u64 + 5;
+        for node in [&a, &b] {
+            assert_eq!(count(&metrics.data_packets_recv, &node.labels()), 1);
+            assert_eq!(count(&metrics.bytes_recv, &node.labels()), packet_len);
+            assert_eq!(count(&metrics.data_packets_sent, &node.labels()), 1);
+            assert_eq!(count(&metrics.bytes_sent, &node.labels()), packet_len);
+            assert_eq!(count(&metrics.data_packets_dropped, &node.labels()), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_metrics() {
+        let (relay, metrics) = start_relay().await;
+        let a = Node::new(1).await;
+        let b = Node::new(2).await;
+        a.register(relay).await;
+        b.register(relay).await;
+
+        a.send_data(relay, &b.key(), b"one").await;
+        a.send_data(relay, &b.key(), b"two").await;
+        b.recv().await;
+        b.recv().await;
+        // Nobody is registered with this key
+        a.send_data(relay, &[0; proto::KEY_LEN], b"lost").await;
+        a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
+        assert_eq!(proto::decode(&a.recv().await), Some(Message::KeepaliveAck));
+
+        // The sender sends, the recipient receives
+        assert_eq!(count(&metrics.data_packets_recv, &a.labels()), 3);
+        assert_eq!(count(&metrics.data_packets_dropped, &a.labels()), 1);
+        assert_eq!(count(&metrics.data_packets_sent, &a.labels()), 0);
+        assert_eq!(count(&metrics.data_packets_recv, &b.labels()), 0);
+        assert_eq!(count(&metrics.data_packets_sent, &b.labels()), 2);
+        assert_eq!(count(&metrics.bytes_sent, &b.labels()), 2 * (proto::DATA_HEADER_LEN as u64 + 3));
+        // The destination key of the lost packet is not a label
+        assert_eq!(metrics.data_packets_recv.len(), 2);
+
+        // Another key from the same address replaces the session of `a` with its labels
+        let a_labels = a.labels();
+        let c = Node { socket: a.socket, secret_key: SecretKey::from_bytes(&[3; 32]) };
+        c.register(relay).await;
+        assert!(metrics.data_packets_recv.get(&a_labels).is_none());
+        assert!(metrics.bytes_sent.get(&a_labels).is_none());
+        assert!(metrics.data_packets_recv.get(&c.labels()).is_some());
+        assert_eq!(metrics.sessions.get(), 2);
+
+        let mut registry = iroh_metrics::Registry::default();
+        registry.register(metrics.clone());
+        let output = registry.encode_openmetrics_to_string().unwrap();
+        let b_bytes = format!("udprelay_bytes_sent_total{{endpoint=\"{}\"}} 72", b.labels().endpoint);
+        assert!(output.contains(&b_bytes), "{output}");
     }
 
     #[tokio::test]
@@ -472,8 +537,10 @@ mod tests {
         a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
         assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
 
-        assert_eq!(metrics.data_packets_dropped.get(), 1);
-        assert_eq!(metrics.data_packets_sent.get(), 0);
+        let unregistered = NodeLabels::unregistered();
+        assert_eq!(count(&metrics.data_packets_recv, &unregistered), 1);
+        assert_eq!(count(&metrics.data_packets_dropped, &unregistered), 1);
+        assert_eq!(count(&metrics.data_packets_sent, &b.labels()), 0);
         assert_eq!(metrics.sent_not_registered.get(), 2);
     }
 
@@ -521,8 +588,10 @@ mod tests {
         a.send_data(relay, &b.key(), b"stale").await;
         assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
 
-        // The new address replaces the old one
+        // The new address replaces the old one, the node keeps its counters
         assert_eq!(metrics.sessions.get(), 2);
         assert_eq!(metrics.registrations.get(), 3);
+        assert_eq!(count(&metrics.data_packets_sent, &a.labels()), 1);
+        assert_eq!(count(&metrics.data_packets_dropped, &NodeLabels::unregistered()), 1);
     }
 }

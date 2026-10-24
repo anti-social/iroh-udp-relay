@@ -57,8 +57,8 @@ The metrics follow iroh-relay's `relayserver` group, with the prefix `udprelay_`
 
 | Metric | Description |
 |---|---|
-| `bytes_recv_total`, `bytes_sent_total` | Relayed traffic, including the data header |
-| `data_packets_recv_total`, `data_packets_sent_total`, `data_packets_dropped_total` | Data packets. Dropped means the sender or the recipient is not registered, or sending failed |
+| `bytes_recv_total`, `bytes_sent_total` | Relayed traffic, including the data header. Per endpoint: received from it, sent to it |
+| `data_packets_recv_total`, `data_packets_sent_total`, `data_packets_dropped_total` | Data packets, per endpoint the same way. Dropped means the sender or the recipient is not registered, or sending failed; it is counted for the sender |
 | `other_packets_recv_total`, `other_packets_sent_total` | Control packets |
 | `unknown_packets_total`, `send_errors_total` | Unknown packets and failed sends |
 | `got_keepalive_total`, `sent_keepalive_ack_total` | Keepalives |
@@ -67,6 +67,14 @@ The metrics follow iroh-relay's `relayserver` group, with the prefix `udprelay_`
 | `registrations_total`, `sessions_expired_total` | Session changes |
 | `auth_failures_total`, `challenges_dropped_total` | Failed signatures, and `Hello`s dropped when too many challenges are pending |
 | `access_denied_total`, `access_revoked_total`, `access_check_errors_total` | Access check results |
+
+The traffic and data packet metrics have an `endpoint` label: the short endpoint id that iroh prints in logs, for example `udprelay_bytes_recv_total{endpoint="b2f36aadd4"}`.
+
+- **Unregistered senders:** packets from addresses without a registration are counted under `endpoint="unregistered"`.
+- **Bounded:** only registered endpoints get their own label. The destination key of a packet is never a label, because a sender can put anything there.
+- **Cleanup:** an endpoint's series are removed when its session expires, is revoked or is replaced. After that, its counters start from zero, which `rate()` and `increase()` handle as a reset.
+
+For totals, sum over the label: `sum(rate(udprelay_bytes_sent_total[5m]))`.
 
 To use the server from your own code, call `server::run(socket, access, metrics)` with the `server` feature enabled.
 
