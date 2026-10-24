@@ -1,6 +1,8 @@
 //! Relay server: binds public keys of nodes to their UDP addresses
 //! and forwards data packets between them.
 
+pub mod metrics;
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -18,6 +20,8 @@ use tokio::sync::mpsc;
 use iroh_base::PublicKey;
 
 use crate::proto::{self, Key, Message, Nonce};
+
+pub use self::metrics::Metrics;
 
 /// The same header as an iroh relay sends to its HTTP access check
 const ENDPOINT_ID_HEADER: &str = "X-Iroh-Endpoint-Id";
@@ -104,9 +108,10 @@ struct Relay {
     /// Authenticated nodes waiting for an access check
     authorizing: HashMap<Key, SocketAddr>,
     access_cache: HashMap<Key, (bool, Instant)>,
+    metrics: Arc<Metrics>,
 }
 
-pub async fn run(socket: UdpSocket, access: Access) -> io::Result<()> {
+pub async fn run(socket: UdpSocket, access: Access, metrics: Arc<Metrics>) -> io::Result<()> {
     let (access_tx, mut access_rx) = mpsc::channel(256);
     let mut relay = Relay {
         is_v6: socket.local_addr()?.is_ipv6(),
@@ -118,6 +123,7 @@ pub async fn run(socket: UdpSocket, access: Access) -> io::Result<()> {
         challenges: HashMap::new(),
         authorizing: HashMap::new(),
         access_cache: HashMap::new(),
+        metrics,
     };
     let mut buf = vec![0; proto::MAX_PACKET_LEN];
     let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
@@ -138,43 +144,58 @@ impl Relay {
     async fn handle_packet(&mut self, buf: &mut [u8], src: SocketAddr) {
         match proto::decode(buf) {
             Some(Message::Data { key, .. }) => {
+                self.metrics.data_packets_recv.inc();
+                self.metrics.bytes_recv.inc_by(buf.len() as u64);
                 let dst = *key;
                 self.forward(buf, src, &dst).await;
             }
             Some(Message::Keepalive) => {
+                self.metrics.other_packets_recv.inc();
+                self.metrics.got_keepalive.inc();
                 if self.touch(&src).is_some() {
-                    self.send(&proto::encode_keepalive_ack(), src).await;
+                    if self.send_control(&proto::encode_keepalive_ack(), src).await {
+                        self.metrics.sent_keepalive_ack.inc();
+                    }
                 } else {
-                    self.send(&proto::encode_not_registered(), src).await;
+                    self.send_not_registered(src).await;
                 }
             }
             Some(Message::Hello { version, key }) => {
                 if version != proto::VERSION {
+                    self.metrics.unknown_packets.inc();
                     log::debug!("Unsupported version {version} from {src}");
                     return;
                 }
+                self.metrics.other_packets_recv.inc();
                 if self.challenges.len() >= MAX_PENDING_CHALLENGES && !self.challenges.contains_key(&src) {
+                    self.metrics.challenges_dropped.inc();
                     log::debug!("Too many pending challenges, dropping hello from {src}");
                     return;
                 }
                 let nonce = proto::random_nonce();
                 self.challenges.insert(src, Challenge { key, nonce, expires: Instant::now() + CHALLENGE_TTL });
-                self.send(&proto::encode_challenge(&nonce, &src), src).await;
+                self.send_control(&proto::encode_challenge(&nonce, &src), src).await;
             }
             Some(Message::Auth { key, nonce, signature }) => {
+                self.metrics.other_packets_recv.inc();
                 let is_expected = self.challenges.get(&src)
                     .is_some_and(|c| c.key == key && c.nonce == nonce && c.expires > Instant::now());
                 if !is_expected {
+                    self.metrics.auth_failures.inc();
                     return;
                 }
                 self.challenges.remove(&src);
                 let Some(public_key) = proto::verify_auth(&key, &nonce, &signature, &src) else {
+                    self.metrics.auth_failures.inc();
                     log::info!("Invalid signature from {src}");
                     return;
                 };
                 match self.access_cache.get(&key) {
                     Some((true, _)) => self.bind(key, src).await,
-                    Some((false, _)) => log::debug!("Access denied: {} ({src})", public_key.fmt_short()),
+                    Some((false, _)) => {
+                        self.metrics.access_denied.inc();
+                        log::debug!("Access denied: {} ({src})", public_key.fmt_short());
+                    }
                     None => {
                         self.authorizing.insert(key, src);
                         self.spawn_access_check(key, public_key);
@@ -182,20 +203,29 @@ impl Relay {
                 }
             }
             Some(Message::Challenge { .. } | Message::Registered | Message::KeepaliveAck | Message::NotRegistered)
-            | None => {}
+            | None => {
+                self.metrics.unknown_packets.inc();
+            }
         }
     }
 
     async fn forward(&mut self, buf: &mut [u8], src: SocketAddr, dst: &Key) {
         let Some(src_key) = self.touch(&src) else {
-            self.send(&proto::encode_not_registered(), src).await;
+            self.metrics.data_packets_dropped.inc();
+            self.send_not_registered(src).await;
             return;
         };
         let Some(dst_addr) = self.sessions.get(dst).map(|s| s.addr) else {
+            self.metrics.data_packets_dropped.inc();
             return;
         };
         proto::encode_data_header(buf, &src_key);
-        self.send(buf, dst_addr).await;
+        if self.send(buf, dst_addr).await {
+            self.metrics.data_packets_sent.inc();
+            self.metrics.bytes_sent.inc_by(buf.len() as u64);
+        } else {
+            self.metrics.data_packets_dropped.inc();
+        }
     }
 
     /// Refreshes a session of a node and returns its key
@@ -220,23 +250,28 @@ impl Relay {
                 self.sessions.remove(&old_key);
             }
         }
+        self.metrics.registrations.inc();
+        self.metrics.sessions.set(self.sessions.len() as i64);
         log::info!("Registered {} from {addr}", fmt_key(&key));
-        self.send(&proto::encode_registered(), addr).await;
+        self.send_control(&proto::encode_registered(), addr).await;
     }
 
     fn remove_session(&mut self, key: &Key) {
         if let Some(session) = self.sessions.remove(key) {
             self.by_addr.remove(&session.addr);
         }
+        self.metrics.sessions.set(self.sessions.len() as i64);
     }
 
     fn spawn_access_check(&self, key: Key, public_key: PublicKey) {
         let access = self.access.clone();
         let access_tx = self.access_tx.clone();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             let allowed = match access.check(&public_key).await {
                 Ok(allowed) => Some(allowed),
                 Err(e) => {
+                    metrics.access_check_errors.inc();
                     log::warn!("Access check of {} failed: {e}", public_key.fmt_short());
                     None
                 }
@@ -251,9 +286,14 @@ impl Relay {
         }
         match (self.authorizing.remove(&key), allowed) {
             (Some(addr), Some(true)) => self.bind(key, addr).await,
-            (Some(addr), _) => log::info!("Access denied: {} ({addr})", fmt_key(&key)),
+            (Some(addr), Some(false)) => {
+                self.metrics.access_denied.inc();
+                log::info!("Access denied: {} ({addr})", fmt_key(&key));
+            }
+            (Some(addr), None) => log::info!("Access denied: {} ({addr})", fmt_key(&key)),
             // A failed recheck keeps the session, so the relay survives restarts of the check service
             (None, Some(false)) if self.sessions.contains_key(&key) => {
+                self.metrics.access_revoked.inc();
                 log::info!("Access revoked: {}", fmt_key(&key));
                 self.remove_session(&key);
             }
@@ -271,6 +311,7 @@ impl Relay {
             .map(|(key, _)| *key)
             .collect::<Vec<_>>();
         for key in expired {
+            self.metrics.sessions_expired.inc();
             log::info!("Session expired: {}", fmt_key(&key));
             self.remove_session(&key);
         }
@@ -294,9 +335,30 @@ impl Relay {
         Ok((len, proto::canonical_addr(src)))
     }
 
-    async fn send(&self, packet: &[u8], addr: SocketAddr) {
-        if let Err(e) = self.socket.send_to(packet, proto::socket_addr(self.is_v6, addr)).await {
-            log::debug!("Cannot send to {addr}: {e}");
+    async fn send_not_registered(&self, addr: SocketAddr) {
+        if self.send_control(&proto::encode_not_registered(), addr).await {
+            self.metrics.sent_not_registered.inc();
+        }
+    }
+
+    /// Sends a packet that is not `Data`
+    async fn send_control(&self, packet: &[u8], addr: SocketAddr) -> bool {
+        let sent = self.send(packet, addr).await;
+        if sent {
+            self.metrics.other_packets_sent.inc();
+        }
+        sent
+    }
+
+    /// Returns `false` if sending failed
+    async fn send(&self, packet: &[u8], addr: SocketAddr) -> bool {
+        match self.socket.send_to(packet, proto::socket_addr(self.is_v6, addr)).await {
+            Ok(_) => true,
+            Err(e) => {
+                self.metrics.send_errors.inc();
+                log::debug!("Cannot send to {addr}: {e}");
+                false
+            }
         }
     }
 }
@@ -360,16 +422,17 @@ mod tests {
         }
     }
 
-    async fn start_relay() -> SocketAddr {
+    async fn start_relay() -> (SocketAddr, Arc<Metrics>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        tokio::spawn(run(socket, Access::AllowAll));
-        addr
+        let metrics = Arc::new(Metrics::default());
+        tokio::spawn(run(socket, Access::AllowAll, metrics.clone()));
+        (addr, metrics)
     }
 
     #[tokio::test]
     async fn test_forward() {
-        let relay = start_relay().await;
+        let (relay, metrics) = start_relay().await;
         let a = Node::new(1).await;
         let b = Node::new(2).await;
         a.register(relay).await;
@@ -385,11 +448,21 @@ mod tests {
 
         a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
         assert_eq!(proto::decode(&a.recv().await), Some(Message::KeepaliveAck));
+
+        // Packets are processed in order, so the ack means the forwarded packets are counted
+        assert_eq!(metrics.sessions.get(), 2);
+        assert_eq!(metrics.registrations.get(), 2);
+        assert_eq!(metrics.data_packets_recv.get(), 2);
+        assert_eq!(metrics.data_packets_sent.get(), 2);
+        assert_eq!(metrics.data_packets_dropped.get(), 0);
+        assert_eq!(metrics.bytes_recv.get(), 2 * (proto::DATA_HEADER_LEN as u64 + 5));
+        assert_eq!(metrics.bytes_sent.get(), metrics.bytes_recv.get());
+        assert_eq!(metrics.got_keepalive.get(), 1);
     }
 
     #[tokio::test]
     async fn test_not_registered() {
-        let relay = start_relay().await;
+        let (relay, metrics) = start_relay().await;
         let a = Node::new(1).await;
         let b = Node::new(2).await;
         b.register(relay).await;
@@ -398,11 +471,15 @@ mod tests {
         assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
         a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
         assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
+
+        assert_eq!(metrics.data_packets_dropped.get(), 1);
+        assert_eq!(metrics.data_packets_sent.get(), 0);
+        assert_eq!(metrics.sent_not_registered.get(), 2);
     }
 
     #[tokio::test]
     async fn test_invalid_auth() {
-        let relay = start_relay().await;
+        let (relay, metrics) = start_relay().await;
         let a = Node::new(1).await;
         let b = Node::new(2).await;
         b.register(relay).await;
@@ -423,11 +500,14 @@ mod tests {
         assert_eq!(proto::decode(&b.recv().await), Some(Message::Data { key: &c.key(), payload: b"to b" }));
         a.socket.send_to(&proto::encode_keepalive(), relay).await.unwrap();
         assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
+
+        assert_eq!(metrics.auth_failures.get(), 1);
+        assert_eq!(metrics.registrations.get(), 2);
     }
 
     #[tokio::test]
     async fn test_rebind() {
-        let relay = start_relay().await;
+        let (relay, metrics) = start_relay().await;
         let a = Node::new(1).await;
         let b = Node::new(2).await;
         b.register(relay).await;
@@ -440,5 +520,9 @@ mod tests {
         assert_eq!(proto::decode(&a2.recv().await), Some(Message::Data { key: &b.key(), payload: b"hello" }));
         a.send_data(relay, &b.key(), b"stale").await;
         assert_eq!(proto::decode(&a.recv().await), Some(Message::NotRegistered));
+
+        // The new address replaces the old one
+        assert_eq!(metrics.sessions.get(), 2);
+        assert_eq!(metrics.registrations.get(), 3);
     }
 }

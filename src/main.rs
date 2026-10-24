@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use argh::FromArgs;
 use hyper::Uri;
@@ -7,7 +8,7 @@ use snafu::{ResultExt, Whatever};
 use tokio::net::UdpSocket;
 
 use iroh_udp_relay::proto;
-use iroh_udp_relay::server::{self, Access};
+use iroh_udp_relay::server::{self, Access, Metrics};
 
 const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::V4(
     SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, proto::DEFAULT_PORT)
@@ -26,6 +27,9 @@ struct Args {
     /// path to a file with a bearer token for the access check
     #[argh(option)]
     access_token_file: Option<PathBuf>,
+    /// tcp address to serve prometheus metrics on (`/metrics`), disabled if not set
+    #[argh(option)]
+    metrics_addr: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -56,11 +60,24 @@ async fn main() -> Result<(), Whatever> {
         }
     };
 
+    let metrics = Arc::new(Metrics::default());
+    let _metrics_server = match args.metrics_addr {
+        Some(addr) => {
+            let mut registry = iroh_metrics::Registry::default();
+            registry.register(metrics.clone());
+            let server = iroh_metrics::service::MetricsServer::spawn(addr, Arc::new(registry)).await
+                .with_whatever_context(|_| format!("Cannot start metrics server: {addr}"))?;
+            log::info!("Serving metrics on {}", server.local_addr());
+            Some(server)
+        }
+        None => None,
+    };
+
     let socket = UdpSocket::bind(args.bind_addr).await
         .with_whatever_context(|_| format!("Cannot bind: {}", args.bind_addr))?;
     log::info!("Listening on {}", args.bind_addr);
     tokio::select! {
-        res = server::run(socket, access) => res.whatever_context("Relay failed"),
+        res = server::run(socket, access, metrics) => res.whatever_context("Relay failed"),
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
