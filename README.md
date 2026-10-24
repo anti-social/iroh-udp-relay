@@ -34,7 +34,7 @@ cargo build --release --features server
 
 | Option | Description |
 |---|---|
-| `--bind-addr` | UDP address to listen on, `0.0.0.0:24896` by default |
+| `--bind-addr` | UDP address to listen on, `0.0.0.0:7843` by default, next to the iroh relay's QUIC address discovery port (7842) |
 | `--access-url` | HTTP access check, see below. Without it any endpoint may use the relay |
 | `--access-token-file` | File with a bearer token for the access check |
 | `--metrics-addr` | TCP address to serve Prometheus metrics on (`/metrics`). Disabled if not set |
@@ -91,7 +91,7 @@ let endpoint = Endpoint::builder(presets::Minimal)
     .secret_key(secret_key.clone())
     .path_selector(Arc::new(DirectFirstPathSelector))
     .add_custom_transport(Arc::new(UdpRelayTransport::new(
-        "relay.example.com:24896".to_string(),
+        "relay.example.com:7843".to_string(),
         secret_key,
     )))
     .bind()
@@ -122,7 +122,7 @@ To keep relayed data off the iroh relay entirely, remove `TransportAddr::Relay` 
 ## Limitations
 
 - **Unstable API:** the client uses iroh's custom transport API (`unstable-custom-transports`), which can change in any iroh release. That's why iroh is pinned to an exact version.
-- **IPv4 only:** the client reaches the relay over IPv4, because dual-stack sockets don't behave the same on every platform. The server listens on IPv4 by default; use `--bind-addr [::]:24896` to also accept IPv6.
+- **IPv4 only:** the client reaches the relay over IPv4, because dual-stack sockets don't behave the same on every platform. The server listens on IPv4 by default; use `--bind-addr [::]:7843` to also accept IPv6.
 
 ## Testing
 

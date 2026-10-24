@@ -20,7 +20,8 @@ use iroh_base::{PublicKey, SecretKey, Signature};
 
 pub const VERSION: u8 = 1;
 
-pub const DEFAULT_PORT: u16 = 24896;
+/// Next to the QUIC address discovery port of an iroh relay (7842)
+pub const DEFAULT_PORT: u16 = 7843;
 
 /// Id of the iroh custom transport that uses the relay
 pub const TRANSPORT_ID: u64 = 0x0049_5544_5052_4c59; // "IUDPRLY"
